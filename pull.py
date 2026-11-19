@@ -108,8 +108,10 @@ def games_on(day):
         return None  # distinguish "call failed" from "no games"
 
     out = []
+    seen = set()
     for g in rows(sb, "GameHeader"):
-        if g.get("GAME_STATUS_ID") == STATUS_FINAL:
+        if g.get("GAME_STATUS_ID") == STATUS_FINAL and g["GAME_ID"] not in seen:
+            seen.add(g["GAME_ID"])  # the scoreboard sometimes lists a game twice
             out.append((g["GAME_ID"], g.get("GAMECODE", "")))
     return out
 
@@ -285,6 +287,7 @@ def norm_name(s):
 def build_logs():
     import glob
     per = {}
+    seen = set()
     for f in sorted(glob.glob(os.path.join(GAMES_DIR, "*.json"))):
         with open(f, encoding="utf-8") as fh:
             d = json.load(fh)
@@ -300,6 +303,9 @@ def build_logs():
                 m = p.get("minutes") or ""
                 if ":" not in m:
                     continue
+                if (g["gameId"], p.get("personId")) in seen:
+                    continue
+                seen.add((g["gameId"], p.get("personId")))
                 a, b = m.split(":")[:2]
                 mins = int(a) + int(b) / 60
                 if mins <= 0:
