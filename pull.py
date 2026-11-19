@@ -271,6 +271,60 @@ def push():
 
 
 # ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# logs.json: one compact file the app's Worker reads (last 30 regular-season
+# games per player, newest first). Keyed by normalized name so ESPN names match.
+# ---------------------------------------------------------------------------
+def norm_name(s):
+    import re, unicodedata
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
+    toks = [t for t in re.sub(r"[^a-z ]", " ", s).split() if t not in ("jr", "sr", "ii", "iii", "iv")]
+    return "".join(toks)
+
+
+def build_logs():
+    import glob
+    per = {}
+    for f in sorted(glob.glob(os.path.join(GAMES_DIR, "*.json"))):
+        with open(f, encoding="utf-8") as fh:
+            d = json.load(fh)
+        for g in d.get("games", []):
+            if not str(g.get("gameId", "")).startswith("002"):
+                continue  # regular season only
+            code = g.get("gameCode", "")
+            try:
+                away, home = code.split("/")[1][:3], code.split("/")[1][3:]
+            except Exception:
+                continue
+            for p in g.get("players", []):
+                m = p.get("minutes") or ""
+                if ":" not in m:
+                    continue
+                a, b = m.split(":")[:2]
+                mins = int(a) + int(b) / 60
+                if mins <= 0:
+                    continue
+                t = p.get("teamTricode")
+                name = f"{p.get('firstName', '')} {p.get('familyName', '')}".strip()
+                rec = per.setdefault(norm_name(name), {"name": name, "pid": p.get("personId"), "team": t, "pos": p.get("position", ""), "log": []})
+                rec["team"], rec["pos"] = t, p.get("position", "") or rec["pos"]
+                rec["log"].append({
+                    "date": d["date"], "opp": away if t == home else home, "home": t == home, "min": round(mins, 1),
+                    "pts": p.get("points", 0), "reb": p.get("reboundsTotal", 0), "ast": p.get("assists", 0),
+                    "stl": p.get("steals", 0), "blk": p.get("blocks", 0), "tpm": p.get("threePointersMade", 0),
+                    "to": p.get("turnovers", 0), "fgm": p.get("fieldGoalsMade", 0), "fga": p.get("fieldGoalsAttempted", 0),
+                    "ftm": p.get("freeThrowsMade", 0), "fta": p.get("freeThrowsAttempted", 0),
+                    "usg": p.get("usagePercentage"),
+                })
+    for rec in per.values():
+        rec["log"].sort(key=lambda x: x["date"], reverse=True)
+        rec["log"] = rec["log"][:30]
+    out = {"asOf": datetime.now().isoformat(timespec="seconds"), "players": per}
+    with open(os.path.join(DATA, "logs.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, separators=(",", ":"), ensure_ascii=False)
+    log(f"logs.json: {len(per)} players")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill", action="store_true", help="scan the whole season")
@@ -300,6 +354,11 @@ def main():
 
     if not args.no_espn:
         espn_snapshot()
+
+    try:
+        build_logs()
+    except Exception:
+        log(f"logs.json: error\n{traceback.format_exc()}")
 
     with open(os.path.join(DATA, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump({
