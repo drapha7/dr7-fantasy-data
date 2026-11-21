@@ -11,6 +11,7 @@ Usage
   python pull.py --backfill      # whole season from SEASON_START
   python pull.py --days 7        # last 7 days
   python pull.py --no-push       # write files, skip git
+  python pull.py --history 5     # one-off: last 5 past seasons of game logs into data/history/
 
 Run from inside the cloned repo folder.
 """
@@ -31,6 +32,7 @@ from nba_api.stats.endpoints import (
     BoxScoreTraditionalV3,
     BoxScoreAdvancedV3,
     BoxScoreUsageV3,
+    LeagueGameLog,
 )
 
 # ----------------------------------------------------------------------
@@ -46,6 +48,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 GAMES_DIR = os.path.join(DATA, "games")
 SEASON_DIR = os.path.join(DATA, "season")
+HISTORY_DIR = os.path.join(DATA, "history")
 LOG_PATH = os.path.join(ROOT, "pull.log")
 
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
@@ -216,6 +219,9 @@ def espn_snapshot():
                 abbr = block.get("team", {}).get("abbreviation")
                 for item in block.get("injuries", []):
                     ath = item.get("athlete", {})
+                    # A team on today's and tomorrow's slate appears twice; keep one entry per player.
+                    if any(x.get("id") == ath.get("id") for x in injuries.get(abbr, [])):
+                        continue
                     injuries.setdefault(abbr, []).append({
                         "name": ath.get("displayName"),
                         "id": ath.get("id"),
@@ -248,6 +254,46 @@ def espn_snapshot():
 
 
 # ----------------------------------------------------------------------
+# history: whole past seasons in two calls each (LeagueGameLog)
+# ----------------------------------------------------------------------
+def season_label(start_year):
+    return f"{start_year}-{str(start_year + 1)[2:]}"
+
+
+def pull_history(n, force=False):
+    """Past n regular seasons: every player game and every team game.
+    Writes data/history/<season>_players.json.gz and _teams.json.gz as
+    {"season", "cols", "rows"} (compact). Seasons already saved are skipped."""
+    import gzip
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    first = SEASON_START.year - 1
+    wrote = 0
+    for y in range(first, first - n, -1):
+        season = season_label(y)
+        for kind, flag in (("players", "P"), ("teams", "T")):
+            path = os.path.join(HISTORY_DIR, f"{season}_{kind}.json.gz")
+            if os.path.exists(path) and not force:
+                log(f"history {season} {kind}: already saved")
+                continue
+            ep = retry(lambda: LeagueGameLog(season=season, season_type_all_star="Regular Season",
+                                             player_or_team_abbreviation=flag, timeout=TIMEOUT),
+                       f"history {season} {kind}")
+            time.sleep(REQUEST_PAUSE * 3)
+            data = rows(ep, "LeagueGameLog")
+            if not data:
+                log(f"history {season} {kind}: no rows (call failed or empty)")
+                continue
+            cols = list(data[0].keys())
+            out = {"season": season, "pulledAt": datetime.now().isoformat(timespec="seconds"),
+                   "cols": cols, "rows": [[r.get(c) for c in cols] for r in data]}
+            with gzip.open(path, "wt", encoding="utf-8") as fh:
+                json.dump(out, fh, separators=(",", ":"), ensure_ascii=False)
+            log(f"history {season} {kind}: {len(data)} rows -> {os.path.basename(path)}")
+            wrote += 1
+    return wrote
+
+
+# ----------------------------------------------------------------------
 # git
 # ----------------------------------------------------------------------
 def git(*args):
@@ -265,6 +311,9 @@ def push():
     if commit.returncode != 0 and "nothing to commit" not in commit.stdout.lower():
         log(f"git commit failed: {commit.stdout}{commit.stderr}")
         return
+    pulled = git("pull", "--rebase", "--autostash")
+    if pulled.returncode != 0:
+        log(f"git pull --rebase failed: {pulled.stderr.strip()}")
     result = git("push")
     if result.returncode != 0:
         log(f"git push failed: {result.stderr.strip()}")
@@ -338,7 +387,16 @@ def main():
     ap.add_argument("--force", action="store_true", help="rewrite dates already saved")
     ap.add_argument("--no-push", action="store_true", help="skip git commit and push")
     ap.add_argument("--no-espn", action="store_true", help="skip injuries and odds")
+    ap.add_argument("--history", type=int, default=0, help="one-off: pull this many past seasons, then stop")
     args = ap.parse_args()
+
+    if args.history:
+        log(f"=== history: last {args.history} season(s)")
+        wrote = pull_history(args.history, force=args.force)
+        log(f"=== history done: {wrote} file(s) written")
+        if wrote and not args.no_push:
+            push()
+        return
 
     os.makedirs(GAMES_DIR, exist_ok=True)
     os.makedirs(SEASON_DIR, exist_ok=True)

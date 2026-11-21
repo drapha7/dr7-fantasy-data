@@ -11,6 +11,7 @@ so the app, drapha-PC and Claude all read from one place.
 | `data/injuries.json` | Current injuries by team, with status and return dates (ESPN) | Every run |
 | `data/odds.json` | Spread and over/under for upcoming games (ESPN) | Every run |
 | `data/meta.json` | Timestamp of the last run | Every run |
+| `data/history/<season>_players.json.gz`, `_teams.json.gz` | Past regular seasons: every player game and team game (NBA.com LeagueGameLog), compact `cols` + `rows` | Once, with `--history` |
 
 ## Running it
 
@@ -19,6 +20,7 @@ so the app, drapha-PC and Claude all read from one place.
     python pull.py --days 7     # last 7 days
     python pull.py --no-push    # write files, skip git
     python pull.py --force      # rewrite dates already saved
+    python pull.py --history 5  # one-off: last 5 past seasons into data/history/ (about 10 calls)
 
 Dates already saved are skipped, so re-running is safe and cheap.
 
