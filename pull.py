@@ -294,6 +294,53 @@ def pull_history(n, force=False):
 
 
 # ----------------------------------------------------------------------
+# player_priors.json: last season's per-game average and game-to-game spread
+# for every player, so the app's prop model has a starting point in the first
+# weeks of a season. Built from data/history; keyed like the Worker's normName.
+# ----------------------------------------------------------------------
+PRIOR_STATS = {"pts": ["PTS"], "reb": ["REB"], "ast": ["AST"], "tpm": ["FG3M"], "stl": ["STL"], "blk": ["BLK"],
+               "pra": ["PTS", "REB", "AST"], "pa": ["PTS", "AST"], "pr": ["PTS", "REB"], "ra": ["REB", "AST"], "sb": ["STL", "BLK"]}
+
+
+def prior_key(name):
+    import unicodedata, re
+    s = unicodedata.normalize("NFKD", name or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"[^a-z ]", " ", s)
+    return "".join(t for t in s.split() if t and t not in ("jr", "sr", "ii", "iii", "iv"))
+
+
+def build_priors():
+    import gzip, statistics
+    season = season_label(SEASON_START.year - 1)
+    path = os.path.join(HISTORY_DIR, f"{season}_players.json.gz")
+    if not os.path.exists(path):
+        log(f"player_priors: no history for {season}; run --history first")
+        return
+    d = json.load(gzip.open(path, "rt", encoding="utf-8"))
+    ix = {c: i for i, c in enumerate(d["cols"])}
+    per = {}
+    for r in d["rows"]:
+        if (r[ix["MIN"]] or 0) < 10:
+            continue
+        per.setdefault(r[ix["PLAYER_ID"]], {"name": r[ix["PLAYER_NAME"]], "games": []})["games"].append(r)
+    out = {}
+    for pid, v in per.items():
+        gs = v["games"]
+        if len(gs) < 15:
+            continue
+        m, sd = {}, {}
+        for k, cols in PRIOR_STATS.items():
+            vals = [sum((g[ix[c]] or 0) for c in cols) for g in gs]
+            m[k] = round(statistics.mean(vals), 2)
+            sd[k] = round(statistics.stdev(vals), 2)
+        out[prior_key(v["name"])] = {"id": pid, "g": len(gs), "min": round(statistics.mean(g[ix["MIN"]] for g in gs), 1), "m": m, "s": sd}
+    with open(os.path.join(DATA, "player_priors.json"), "w", encoding="utf-8") as fh:
+        json.dump({"season": season, "players": out}, fh, separators=(",", ":"), ensure_ascii=False)
+    log(f"player_priors.json: {len(out)} players from {season}")
+
+
+# ----------------------------------------------------------------------
 # git
 # ----------------------------------------------------------------------
 def git(*args):
@@ -393,8 +440,9 @@ def main():
     if args.history:
         log(f"=== history: last {args.history} season(s)")
         wrote = pull_history(args.history, force=args.force)
+        build_priors()
         log(f"=== history done: {wrote} file(s) written")
-        if wrote and not args.no_push:
+        if not args.no_push:
             push()
         return
 
