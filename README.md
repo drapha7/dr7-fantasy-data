@@ -10,6 +10,8 @@ so the app, drapha-PC and Claude all read from one place.
 | `data/games/YYYY-MM-DD.json` | Every final game that date: per-player traditional + advanced + usage stats, team totals, starters/bench | Nightly, append-only |
 | `data/injuries.json` | Current injuries by team, with status and return dates (ESPN) | Every run |
 | `data/odds.json` | Spread and over/under for upcoming games (ESPN) | Every run |
+| `data/logs.json` | Last 30 games per player this season, with position (G/F/C) and usage | Every run |
+| `data/dvp.json` | Defence by position: for each team and G/F/C (plus `all`), how much opponents produced versus their own per-minute norm (1.08 = 8% more), rank 1 = toughest, and `beta`, the per-stat weight the app gives the matchup (re-fit nightly, walk-forward; `tools/dvp_fit.py` prints the backtest) | Every run |
 | `data/meta.json` | Timestamp of the last run | Every run |
 | `data/history/<season>_players.json.gz`, `_teams.json.gz` | Past regular seasons: every player game and team game (NBA.com LeagueGameLog), compact `cols` + `rows` | Once, with `--history` |
 

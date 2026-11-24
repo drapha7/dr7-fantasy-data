@@ -380,7 +380,202 @@ def norm_name(s):
     return "".join(toks)
 
 
+# ----------------------------------------------------------------------
+# Positions and defence by position
+# ----------------------------------------------------------------------
+DVP_STATS = ("pts", "reb", "ast", "tpm", "stl", "blk")
+DVP_PRIOR_GAMES = 10   # team-wide ratio: shrink toward 1.0 by this many average player-games
+DVP_POS_GAMES = 40     # position ratio: shrink toward the team-wide ratio by this many
+
+
+def player_index_positions():
+    """NBA.com player index: one call, POSITION for every player ('G', 'G-F', 'F-C', 'C').
+    Returns {personId: 'G'|'F'|'C'} using the first listed position, or {} on failure."""
+    try:
+        from nba_api.stats.endpoints import PlayerIndex
+        d = retry(lambda: PlayerIndex(league_id="00", season=season_label(SEASON_START.year), timeout=TIMEOUT).get_normalized_dict(), "player index")
+        out = {}
+        for r in (d or {}).get("PlayerIndex", []):
+            pos = (r.get("POSITION") or "").strip()
+            if pos and pos[0] in "GFC":
+                out[r.get("PERSON_ID")] = pos[0]
+        log(f"player index: {len(out)} positions")
+        return out
+    except Exception:
+        log(f"player index: failed, using box-score starts and stat guesses\n{traceback.format_exc()}")
+        return {}
+
+
+def guess_position(logrows):
+    """Last resort for a bench player NBA.com did not list: per-36 rebounds/blocks/assists."""
+    m = sum(g["min"] for g in logrows) or 1
+    p36 = lambda k: sum(g.get(k, 0) for g in logrows) * 36 / m
+    if p36("reb") >= 10.5 or p36("blk") >= 1.8:
+        return "C"
+    if p36("ast") >= 5.0:
+        return "G"
+    return "F"
+
+
+def assign_positions(per, index=None):
+    """G / F / C for every player: most frequent starting position, else the NBA.com
+    player index, else a guess from his stats. Writes rec['pos'] and rec['posFrom']."""
+    if index is None:
+        index = player_index_positions()
+    for rec in per.values():
+        starts = rec.get("_starts") or {}
+        if starts:
+            rec["pos"], rec["posFrom"] = max(starts, key=starts.get), "starts"
+        elif index.get(rec.get("pid")):
+            rec["pos"], rec["posFrom"] = index[rec["pid"]], "index"
+        elif rec["log"]:
+            rec["pos"], rec["posFrom"] = guess_position(rec["log"]), "guess"
+
+
+def dvp_table(per, before=None, since=None):
+    """Defence by position, measured against expectation.
+
+    For every player-game: expected stat = the player's own per-minute rate in his OTHER
+    games x his minutes that night. For each opponent and position (G/F/C) the ratio
+    sum(actual) / sum(expected) says how much that defence gives up versus normal:
+    1.08 = 8% more than those players usually produce. Each ratio is shrunk toward 1.0 by
+    DVP_PRIOR_GAMES average player-games. Optional before/since limit the dates (backtest)."""
+    totals = {}
+    for rec in per.values():
+        rows = [g for g in rec["log"] if (before is None or g["date"] < before) and (since is None or g["date"] >= since)]
+        rows_all = [g for g in rec["log"] if before is None or g["date"] < before]
+        pos = rec.get("pos")
+        if pos not in ("G", "F", "C") or len(rows_all) < 5:
+            continue
+        mins = sum(g["min"] for g in rows_all)
+        if mins < 60:
+            continue
+        sums = {k: sum(g.get(k, 0) for g in rows_all) for k in DVP_STATS}
+        for g in rows:
+            if g["min"] < 6 or mins - g["min"] <= 0:
+                continue
+            cell = totals.setdefault(g["opp"], {}).setdefault(pos, {"n": 0, "a": {k: 0.0 for k in DVP_STATS}, "e": {k: 0.0 for k in DVP_STATS}})
+            cell["n"] += 1
+            for k in DVP_STATS:
+                cell["a"][k] += g.get(k, 0)
+                cell["e"][k] += (sums[k] - g.get(k, 0)) / (mins - g["min"]) * g["min"]  # leave this game out
+    # Two levels: the team's ratio over all positions (shrunk toward 1.0), then each
+    # position's ratio shrunk toward its team's. Early in the season a position has few
+    # games and leans on the team number; it earns its own as the games pile up.
+    keys = DVP_STATS + ("pra",)
+    val = lambda c, k: sum(c[k2] for k2 in ("pts", "reb", "ast")) if k == "pra" else c[k]
+    avg = {}
+    for pos in ("G", "F", "C", "all"):
+        cells = [c for t in totals.values() for p2, c in t.items() if pos in (p2, "all")]
+        n = sum(c["n"] for c in cells) or 1
+        avg[pos] = {k: sum(val(c["e"], k) for c in cells) / n for k in keys}
+    out = {}
+    for team, bypos in totals.items():
+        A = {k: sum(val(c["a"], k) for c in bypos.values()) for k in keys}
+        E = {k: sum(val(c["e"], k) for c in bypos.values()) for k in keys}
+        teamr = {}
+        for k in keys:
+            K = DVP_PRIOR_GAMES * avg["all"][k]
+            teamr[k] = (A[k] + K) / (E[k] + K) if E[k] + K > 0 else 1.0
+        out[team] = {"all": {k: round(teamr[k], 3) for k in keys}}
+        out[team]["all"]["n"] = sum(c["n"] for c in bypos.values())
+        for pos, c in bypos.items():
+            r = {}
+            for k in keys:
+                K = DVP_POS_GAMES * avg[pos][k]
+                r[k] = round((val(c["a"], k) + K * teamr[k]) / (val(c["e"], k) + K), 3) if val(c["e"], k) + K > 0 else round(teamr[k], 3)
+            r["n"] = c["n"]
+            out[team][pos] = r
+    for pos in ("G", "F", "C", "all"):  # rank 1 = gives up least = toughest matchup
+        order = sorted((t for t in out if pos in out[t]), key=lambda t: out[t][pos]["pra"])
+        for i, t in enumerate(order):
+            out[t][pos]["rank"] = i + 1
+    return out
+
+
+DVP_BETA_PRIOR = {"pts": 0.3, "reb": 0.2, "ast": 0.4, "tpm": 0.2, "stl": 0.2, "blk": 0.2, "pra": 0.35}
+DVP_BETA_WEIGHT = 2000  # player-games the prior is worth when blending with the measured beta
+
+
+def fit_dvp_beta(per, max_dates=20):
+    """How strongly each stat follows the matchup, measured walk-forward on this season:
+    for each recent date D, ratios from games before D vs how far players landed from
+    their own expectation on D. Least-squares beta in actual/expected ~ ratio ** beta,
+    blended with DVP_BETA_PRIOR by sample size and kept within 0..0.8. The app multiplies
+    a projection by ratio ** beta, so 0 = ignore the matchup, 1 = take it at face value."""
+    import math
+    dates = sorted({g["date"] for r in per.values() for g in r["log"]})
+    test = dates[len(dates) // 2:][-max_dates:]
+    keys = tuple(DVP_BETA_PRIOR)
+    xs = {k: [] for k in keys}
+    for D in test:
+        table = dvp_table(per, before=D)
+        for rec in per.values():
+            pos = rec.get("pos")
+            prior = [g for g in rec["log"] if g["date"] < D]
+            if pos not in ("G", "F", "C") or len(prior) < 5:
+                continue
+            mins = sum(g["min"] for g in prior)
+            for g in rec["log"]:
+                if g["date"] != D or g["min"] < 15:
+                    continue
+                cell = table.get(g["opp"], {}).get(pos)
+                if not cell:
+                    continue
+                for k in keys:
+                    ks = ("pts", "reb", "ast") if k == "pra" else (k,)
+                    exp = sum(sum(h.get(s2, 0) for h in prior) for s2 in ks) / mins * g["min"]
+                    if exp >= 1.0:
+                        xs[k].append((math.log(cell[k]), math.log((sum(g.get(s2, 0) for s2 in ks) + 0.5) / (exp + 0.5))))
+    out = {}
+    for k in keys:
+        v, prior = xs[k], DVP_BETA_PRIOR[k]
+        if len(v) < 50:
+            out[k] = {"beta": prior, "measured": None, "n": len(v)}
+            continue
+        mx = sum(a for a, _ in v) / len(v); my = sum(b for _, b in v) / len(v)
+        sxx = sum((a - mx) ** 2 for a, _ in v); sxy = sum((a - mx) * (b - my) for a, b in v)
+        b = sxy / sxx if sxx else 0.0
+        w = len(v) / (len(v) + DVP_BETA_WEIGHT)
+        out[k] = {"beta": round(min(0.8, max(0.0, w * b + (1 - w) * prior)), 3), "measured": round(b, 3), "n": len(v)}
+    return out
+
+
+def build_dvp(per):
+    table = dvp_table(per)
+    try:
+        beta = fit_dvp_beta(per)
+    except Exception:
+        log(f"dvp beta fit failed, using priors\n{traceback.format_exc()}")
+        beta = {k: {"beta": v, "measured": None, "n": 0} for k, v in DVP_BETA_PRIOR.items()}
+    src = {}
+    for rec in per.values():
+        src[rec.get("posFrom", "none")] = src.get(rec.get("posFrom", "none"), 0) + 1
+    out = {"asOf": datetime.now().isoformat(timespec="seconds"), "priorGames": DVP_PRIOR_GAMES, "posGames": DVP_POS_GAMES,
+           "stats": list(DVP_STATS) + ["pra"], "beta": beta, "positionsFrom": src, "teams": table}
+    with open(os.path.join(DATA, "dvp.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, separators=(",", ":"))
+    log(f"dvp.json: {len(table)} teams; positions from {src}")
+
+
 def build_logs():
+    per = load_player_games()
+    assign_positions(per)
+    try:
+        build_dvp(per)
+    except Exception:
+        log(f"dvp.json: failed, app keeps team-wide defence\n{traceback.format_exc()}")
+    for rec in per.values():
+        rec["log"] = rec["log"][:30]
+        rec.pop("_starts", None)
+    out = {"asOf": datetime.now().isoformat(timespec="seconds"), "players": per}
+    with open(os.path.join(DATA, "logs.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, separators=(",", ":"), ensure_ascii=False)
+    log(f"logs.json: {len(per)} players")
+
+
+def load_player_games():
+    """Every regular-season player-game this season from data/games, newest first per player."""
     import glob
     per = {}
     seen = set()
@@ -408,8 +603,11 @@ def build_logs():
                     continue
                 t = p.get("teamTricode")
                 name = f"{p.get('firstName', '')} {p.get('familyName', '')}".strip()
-                rec = per.setdefault(norm_name(name), {"name": name, "pid": p.get("personId"), "team": t, "pos": p.get("position", ""), "log": []})
-                rec["team"], rec["pos"] = t, p.get("position", "") or rec["pos"]
+                rec = per.setdefault(norm_name(name), {"name": name, "pid": p.get("personId"), "team": t, "pos": "", "log": []})
+                rec["team"] = t
+                if p.get("position"):  # only starters get one in the box score; count them
+                    starts = rec.setdefault("_starts", {})
+                    starts[p["position"]] = starts.get(p["position"], 0) + 1
                 rec["log"].append({
                     "date": d["date"], "opp": away if t == home else home, "home": t == home, "min": round(mins, 1),
                     "pts": p.get("points", 0), "reb": p.get("reboundsTotal", 0), "ast": p.get("assists", 0),
@@ -420,11 +618,7 @@ def build_logs():
                 })
     for rec in per.values():
         rec["log"].sort(key=lambda x: x["date"], reverse=True)
-        rec["log"] = rec["log"][:30]
-    out = {"asOf": datetime.now().isoformat(timespec="seconds"), "players": per}
-    with open(os.path.join(DATA, "logs.json"), "w", encoding="utf-8") as fh:
-        json.dump(out, fh, separators=(",", ":"), ensure_ascii=False)
-    log(f"logs.json: {len(per)} players")
+    return per
 
 
 def main():
